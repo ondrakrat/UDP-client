@@ -23,7 +23,8 @@ public class Robot {
             connection = new Connection(args[0]);
             connection.downloadFile();
         } else if (args.length == 2) {
-            // toDo: implement
+            connection = new Connection(args[0], args[1]);
+            connection.uploadFile();
         } else {
             System.out.println("Usage: Robot <hostname> for photo download, Robot <hostname> <file> for firmware upload");
         }
@@ -43,12 +44,19 @@ class Connection {
     private final DatagramSocket socket;
     private final long startTime;   // time when the connection was established (for timeout)
     private int connId = 0; // id of this connection
+    private File uploadFile;    // file to upload to server
 
+    // toDo: handle exceptions
     public Connection(String address) throws IOException {
         this.address = InetAddress.getByName(address);
         this.socket = new DatagramSocket(LOCAL_PORT);
         this.startTime = System.currentTimeMillis();
         System.out.printf("Connecting to %s:%d%n", address, REMOTE_PORT);
+    }
+
+    public Connection(String address, String file) throws IOException {
+        this(address);
+        this.uploadFile = new File(file);
     }
 
     /**
@@ -84,14 +92,14 @@ class Connection {
      * Sends the initial packet, repeat up to 20 times if the response is not valid. If the response is still
      * invalid, sends a reset packet. Once a valid response is received, connId is set to received value.
      */
-    public void openConnection() throws IOException {
+    public void openConnection(byte[] initialData) throws IOException {
         int retryCount = 0;
         // timeout the thread after 100 ms
         ExecutorService executorService = Executors.newSingleThreadExecutor();
         Future future = executorService.submit(new InitialPacketReceiver());
         // repeat the initial message 20 times if the response is invalid
         do {
-            sendPacket(Packet.initialPacket(Packet.DOWNLOAD, address, REMOTE_PORT));
+            sendPacket(Packet.initialPacket(initialData, address, REMOTE_PORT));
             try {
                 future.get(TIMEOUT, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
@@ -117,14 +125,14 @@ class Connection {
      * Downloads the photo from the server and saves it to file
      */
     public void downloadFile() throws IOException {
-        openConnection();
+        openConnection(Packet.DOWNLOAD);
         if (connId == 0) {
             System.err.println("Connection was not opened, RST flag was sent to the server");
         } else {
             // got valid response, start accepting photo packets
             // flag has to be 0, connId has to be the same
             System.out.print("\n\nDOWNLOADING STARTED\n\n");
-            PacketHandler handler = new DataPacketHandler();
+            DataPacketHandler handler = new DataPacketHandler();
             Packet dataPacket;
             Packet packetToSend = null;
             do {
@@ -135,10 +143,26 @@ class Connection {
                 if (dataPacket.getConnId() != connId) {
                     continue;
                 }
-                // toDo: write data to file
                 packetToSend = handler.handlePacket(dataPacket);
             } while (dataPacket.getFlag() == Packet.EMPTY_FLAG || dataPacket.getConnId() != connId);
+//            if (dataPacket.getFlag() == Packet.FIN_FLAG) {
             System.out.print("\n\nDOWNLOADING FINISHED\n\n");
+            // toDo: send FIN packet
+            // write the data into file
+//                handler.writeToFile();
+//            }
+        }
+    }
+
+    /**
+     * Uploads the file with firmware to the server
+     */
+    public void uploadFile() throws IOException {
+        openConnection(Packet.UPLOAD);
+        if (connId == 0) {
+            System.err.println("Connection was not opened, RST flag was sent to the server");
+        } else {
+            // toDo: implement
         }
     }
 
@@ -226,6 +250,22 @@ class DataPacketHandler implements PacketHandler {
             }
         }
         return new Packet(packet.getConnId(), (short) 0, (short) currentSeq, Packet.EMPTY_FLAG, new byte[0], packet.getAddress(), packet.getPort());
+    }
+
+    /**
+     * Writes the data into a file
+     *
+     * @return true if writing was successful
+     */
+    public boolean writeToFile() {
+        try {
+            for (byte[] bytes : content) {
+                fos.write(bytes);
+            }
+        } catch (IOException e) {
+            return false;
+        }
+        return true;
     }
 }
 
