@@ -206,12 +206,13 @@ interface PacketHandler {
 class DataPacketHandler implements PacketHandler {
 
     private final String FILENAME = "foto.png";
-    private final int WINDOW_SIZE = 2040;
+    private final int WINDOW_SIZE = 8;  // 8 packets containing up to 255 bytes of data = 2040
     private final int TIMEOUT = 100;    // timeout in milliseconds
     private File file;
     private FileOutputStream fos;
     private LinkedList<byte[]> content;   // list of complete photo data
     private int currentSeq = 0;
+    private int overflowCount = 0;
 
     public DataPacketHandler() {
         try {
@@ -231,25 +232,40 @@ class DataPacketHandler implements PacketHandler {
      * @return response packet
      */
     public Packet handlePacket(Packet packet) {
+        // how many times did the sequence number overflow unsigned short (65535)
+        overflowCount = currentSeq / 0x10000;
         // increase the size of the list if necessary
-        while (Packet.toUnsignedShort(packet.getSeq()) / 255 >= content.size()) {
+        while (getPacketIndex(packet.getSeq()) >= content.size()) {
             content.add(null);
         }
-        if (content.get(Packet.toUnsignedShort(packet.getSeq()) / 255) == null) {
+        if (content.get(getPacketIndex(packet.getSeq())) == null) {
             // this packet was not yet accepted
-            content.set(Packet.toUnsignedShort(packet.getSeq()) / 255, packet.getData());
+            content.set(getPacketIndex(packet.getSeq()), packet.getData());
         } else {
             // this packet was already accepted
         }
         // window should be shifted
-        if (Packet.toUnsignedShort(packet.getSeq()) == (short) currentSeq) {
-            int index = Packet.toUnsignedShort(packet.getSeq()) / 255;
+        if ((packet.getSeq() + (overflowCount * 0x10000)) == currentSeq) {
+            int index = getPacketIndex(packet.getSeq());
             while (index < content.size() && content.get(index) != null) {
                 currentSeq += packet.getData().length;
                 ++index;
             }
         }
         return new Packet(packet.getConnId(), (short) 0, (short) currentSeq, Packet.EMPTY_FLAG, new byte[0], packet.getAddress(), packet.getPort());
+    }
+
+    /**
+     * Return the correct index of data within the linked list
+     *
+     * @param packetSeq packet sequence number
+     * @return index in the linked list
+     */
+    private int getPacketIndex(int packetSeq) {
+        if ((currentSeq % 0xffff) > 62000 && packetSeq < 3000 && content.get((packetSeq + (overflowCount * 0xffff)) / 255) != null) {
+            return (packetSeq + ((overflowCount + 1) * 0xffff)) / 255;
+        }
+        return (packetSeq + (overflowCount * 0xffff)) / 255;
     }
 
     /**
@@ -290,14 +306,14 @@ class Packet {
     public static final byte[] UPLOAD = {0b0010};
 
     private final int connId;
-    private final short seq;
-    private final short ack;
+    private final int seq;
+    private final int ack;
     private final byte flag;
     private final byte[] data;
     private final InetAddress address;
     private final int port;
 
-    public Packet(int connId, short seq, short ack, byte flag, byte[] data, InetAddress address, int port) {
+    public Packet(int connId, int seq, int ack, byte flag, byte[] data, InetAddress address, int port) {
         this.connId = connId;
         this.seq = seq;
         this.ack = ack;
@@ -310,8 +326,8 @@ class Packet {
     public Packet(DatagramPacket packet) {
         ByteBuffer buffer = ByteBuffer.wrap(packet.getData());  // ByteBuffer default is Big Endian
         this.connId = buffer.getInt();
-        this.seq = buffer.getShort();
-        this.ack = buffer.getShort();
+        this.seq = buffer.getShort() & 0xffff;
+        this.ack = buffer.getShort() & 0xffff;
         this.flag = buffer.get();
         data = new byte[packet.getLength() - 9];    // 4 + 2 + 2 + 1 = 9 (packet header length)
         for (int i = 0; i < data.length; ++i) {
@@ -325,11 +341,11 @@ class Packet {
         return connId;
     }
 
-    public short getSeq() {
+    public int getSeq() {
         return seq;
     }
 
-    public short getAck() {
+    public int getAck() {
         return ack;
     }
 
@@ -357,8 +373,8 @@ class Packet {
     public DatagramPacket createPacket() throws UnknownHostException {
         ByteBuffer byteBuffer = ByteBuffer.allocate(data.length + 9);
         byteBuffer.putInt(connId);
-        byteBuffer.putShort(seq);
-        byteBuffer.putShort(ack);
+        byteBuffer.putShort((short) (seq & 0xffff));
+        byteBuffer.putShort((short) (ack & 0xffff));
         byteBuffer.put(flag);
         byteBuffer.put(data);
         DatagramPacket packet = new DatagramPacket(byteBuffer.array(), data.length + 9, address, port);
@@ -382,7 +398,7 @@ class Packet {
      */
     public void printPacket(PacketType packetType) {
         System.out.printf(packetType.getTitle() + " connID: %x seq: %d ack: %d flag: %d data: ",
-                connId, toUnsignedShort(seq), toUnsignedShort(ack), flag);
+                connId, seq & 0xffff, ack & 0xffff, flag);
         for (byte b : data) {
             System.out.printf("%x ", b);
         }
