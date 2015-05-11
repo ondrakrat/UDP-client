@@ -1,9 +1,6 @@
 package robot;
 
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
-import java.io.IOException;
+import java.io.*;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -125,7 +122,7 @@ class Connection {
     /**
      * Downloads the photo from the server and saves it to file
      */
-    public void downloadFile() throws IOException {
+    public void downloadFile() throws IOException { // toDo: timeout when connection is unexpectedly closed
         openConnection(Packet.DOWNLOAD);
         if (connId == 0) {
             System.err.println("Connection was not opened, RST flag was sent to the server");
@@ -147,8 +144,8 @@ class Connection {
                 packetToSend = handler.handlePacket(dataPacket);
             } while (dataPacket.getFlag() == Packet.EMPTY_FLAG || dataPacket.getConnId() != connId);
             if (packetToSend.getFlag() == Packet.FIN_FLAG) {
-                System.out.print("\n\nDOWNLOADING FINISHED\n\n");
                 sendPacket(packetToSend);
+                System.out.print("\n\nDOWNLOADING FINISHED\n\n");
             }
             handler.closeStream();
         }
@@ -300,6 +297,25 @@ class DataPacketHandler implements PacketHandler {
             return false;
         }
         return true;
+    }
+}
+
+/**
+ * Sends a file by packets to the server
+ */
+class FileSender {
+
+    private final int WINDOW_SIZE = 8;  // 8 packets containing up to 255 bytes of data = 2040
+    private File file;
+    private FileInputStream fis;
+
+    public FileSender(String fileName) {
+        try {
+            this.file = new File(fileName);
+            this.fis = new FileInputStream(file);
+        } catch (FileNotFoundException e) {
+            System.err.printf("File %s was not found.%n", fileName);
+        }
     }
 }
 
