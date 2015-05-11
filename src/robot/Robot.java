@@ -9,6 +9,7 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.concurrent.*;
 
@@ -145,12 +146,11 @@ class Connection {
                 }
                 packetToSend = handler.handlePacket(dataPacket);
             } while (dataPacket.getFlag() == Packet.EMPTY_FLAG || dataPacket.getConnId() != connId);
-//            if (dataPacket.getFlag() == Packet.FIN_FLAG) {
-            System.out.print("\n\nDOWNLOADING FINISHED\n\n");
-            // toDo: send FIN packet
-            // write the data into file
-//                handler.writeToFile();
-//            }
+            if (packetToSend.getFlag() == Packet.FIN_FLAG) {
+                System.out.print("\n\nDOWNLOADING FINISHED\n\n");
+                sendPacket(packetToSend);
+            }
+            handler.closeStream();
         }
     }
 
@@ -207,19 +207,18 @@ class DataPacketHandler implements PacketHandler {
 
     private final String FILENAME = "foto.png";
     private final int WINDOW_SIZE = 8;  // 8 packets containing up to 255 bytes of data = 2040
-    private final int TIMEOUT = 100;    // timeout in milliseconds
     private File file;
     private FileOutputStream fos;
     private LinkedList<byte[]> content;   // list of complete photo data
-    private int currentSeq = 0;
-    private int overflowCount = 0;
+    private int written = 0;    // amount of written bytes
 
     public DataPacketHandler() {
         try {
             this.file = new File(FILENAME);
             this.fos = new FileOutputStream(file);
             this.content = new LinkedList<>();
-            content.add(null);
+            // init the data container
+            shiftWindow();
         } catch (FileNotFoundException e) {
             System.err.printf("File with name %s not found.%n", FILENAME);
         }
@@ -228,44 +227,29 @@ class DataPacketHandler implements PacketHandler {
     /**
      * Handles given packet
      *
-     * @param packet
+     * @param packet received packet
      * @return response packet
      */
     public Packet handlePacket(Packet packet) {
-        // how many times did the sequence number overflow unsigned short (65535)
-        overflowCount = currentSeq / 0x10000;
-        // increase the size of the list if necessary
-        while (getPacketIndex(packet.getSeq()) >= content.size()) {
-            content.add(null);
+        // downloading is completed
+        if (packet.getFlag() == Packet.FIN_FLAG) {
+            return Packet.finPacket(packet.getConnId(), packet.getSeq(), packet.getAddress(), packet.getPort());
         }
-        if (content.get(getPacketIndex(packet.getSeq())) == null) {
+        int seq = packet.getSeq();
+        // get correct index if unsigned int overflowed (even multiple times)
+        while (seq % 255 != 0) {
+            seq += 0x10000;
+        }
+        int index = (seq - written) / 255;
+        if (index >= 0 && content.get(index) == null) {
             // this packet was not yet accepted
-            content.set(getPacketIndex(packet.getSeq()), packet.getData());
+            content.set(index, packet.getData());
         } else {
             // this packet was already accepted
         }
-        // window should be shifted
-        if ((packet.getSeq() + (overflowCount * 0x10000)) == currentSeq) {
-            int index = getPacketIndex(packet.getSeq());
-            while (index < content.size() && content.get(index) != null) {
-                currentSeq += packet.getData().length;
-                ++index;
-            }
-        }
-        return new Packet(packet.getConnId(), (short) 0, (short) currentSeq, Packet.EMPTY_FLAG, new byte[0], packet.getAddress(), packet.getPort());
-    }
-
-    /**
-     * Return the correct index of data within the linked list
-     *
-     * @param packetSeq packet sequence number
-     * @return index in the linked list
-     */
-    private int getPacketIndex(int packetSeq) {
-        if ((currentSeq % 0xffff) > 62000 && packetSeq < 3000 && content.get((packetSeq + (overflowCount * 0xffff)) / 255) != null) {
-            return (packetSeq + ((overflowCount + 1) * 0xffff)) / 255;
-        }
-        return (packetSeq + (overflowCount * 0xffff)) / 255;
+        writeToFile();
+        shiftWindow();
+        return new Packet(packet.getConnId(), (short) 0, (short) written, Packet.EMPTY_FLAG, new byte[0], packet.getAddress(), packet.getPort());
     }
 
     /**
@@ -275,10 +259,44 @@ class DataPacketHandler implements PacketHandler {
      */
     public boolean writeToFile() {
         try {
-            for (byte[] bytes : content) {
-                fos.write(bytes);
+            Iterator<byte[]> iterator = content.iterator();
+            while (iterator.hasNext()) {
+                byte[] data = iterator.next();
+                if (data == null) {
+                    break;
+                } else {
+                    fos.write(data);
+                    written += data.length;
+                    iterator.remove();
+                }
             }
         } catch (IOException e) {
+            System.err.println("Writing to file failed.");
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Shifts the packet accepting window.
+     */
+    private void shiftWindow() {
+        while (content.size() < WINDOW_SIZE) {
+            content.add(null);
+        }
+    }
+
+    /**
+     * Properly closes the stream when all the data is written.
+     *
+     * @return true if closing was successful
+     */
+    public boolean closeStream() {
+        try {
+            fos.flush();
+            fos.close();
+        } catch (IOException e) {
+            System.err.println("Cannot close stream.");
             return false;
         }
         return true;
@@ -385,10 +403,24 @@ class Packet {
      * Create initial packet, use {@link Packet#DOWNLOAD} or {@link Packet#UPLOAD} as an argument
      *
      * @param data
+     * @param address
+     * @param port
      * @return
      */
     public static Packet initialPacket(byte[] data, InetAddress address, int port) {
         return new Packet(0, (short) 0, (short) 0, SYN_FLAG, data, address, port);
+    }
+
+    /**
+     * Create packet that is sent after successfully downloading a photo
+     *
+     * @param connId
+     * @param address
+     * @param port
+     * @return
+     */
+    public static Packet finPacket(int connId, int ack, InetAddress address, int port) {
+        return new Packet(connId, (short) 0, (short) ack & 0xffff, FIN_FLAG, new byte[0], address, port);
     }
 
     /**
