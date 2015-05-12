@@ -1,10 +1,8 @@
 package robot;
 
+import java.awt.color.ProfileDataException;
 import java.io.*;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
+import java.net.*;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Iterator;
@@ -17,15 +15,19 @@ import java.util.concurrent.*;
 public class Robot {
 
     public static void main(String[] args) throws IOException {
-        Connection connection;
-        if (args.length == 1) {
-            connection = new Connection(args[0]);
-            connection.downloadFile();
-        } else if (args.length == 2) {
-            connection = new Connection(args[0], args[1]);
-            connection.uploadFile();
-        } else {
-            System.out.println("Usage: Robot <hostname> for photo download, Robot <hostname> <file> for firmware upload");
+        try {
+            Connection connection;
+            if (args.length == 1) {
+                connection = new Connection(args[0]);
+                connection.downloadFile();
+            } else if (args.length == 2) {
+                connection = new Connection(args[0], args[1]);
+                connection.uploadFile();
+            } else {
+                System.out.println("Usage: Robot <hostname> for photo download, Robot <hostname> <file> for firmware upload");
+            }
+        } catch (PackageDeliveryException e) {
+            System.err.println(e.getMessage());
         }
     }
 }
@@ -44,6 +46,9 @@ class Connection {
     private final long startTime;   // time when the connection was established (for timeout)
     private int connId = 0; // id of this connection
     private String fileName;    // name of file that is to be uploaded to the server
+    private int lastSeq = 0;    // seq of last sent packet
+    private int sameSeqCount = 0;    // how many times in a row was a packet with the same seq number sent
+    private boolean closed = false;  // is the connection still open
 
     // toDo: handle exceptions
     public Connection(String address) throws IOException {
@@ -62,19 +67,31 @@ class Connection {
         return connId;
     }
 
+    public boolean isClosed() {
+        return closed;
+    }
+
+    public synchronized void setClosed(boolean closed) {
+        this.closed = closed;
+    }
+
     /**
      * Sends a packet.
      *
      * @param packet
      * @return true if sending was successful
      */
-    public boolean sendPacket(Packet packet) {
+    public boolean sendPacket(Packet packet) throws PackageDeliveryException {
+        if (packet.getData().length > 0 && packet.getSeq() == lastSeq && sameSeqCount++ > 19) {
+            throw new PackageDeliveryException("Sending a packet with seq " + packet.getSeq() + " 20 times in a row");
+        }
         try {
             packet.printPacket(PacketType.SENT);
             DatagramPacket datgramPacket = packet.createPacket();
             datgramPacket.setAddress(address);
             datgramPacket.setPort(REMOTE_PORT);
             socket.send(datgramPacket);
+            lastSeq = packet.getSeq();
             return true;
         } catch (IOException e) {
             return false;
@@ -98,7 +115,7 @@ class Connection {
      * Sends the initial packet, repeat up to 20 times if the response is not valid. If the response is still
      * invalid, sends a reset packet. Once a valid response is received, connId is set to received value.
      */
-    public void openConnection(byte[] initialData) throws IOException {
+    public void openConnection(byte[] initialData) throws IOException, PackageDeliveryException {
         int retryCount = 0;
         // timeout the thread after 100 ms
         ExecutorService executorService = Executors.newSingleThreadExecutor();
@@ -130,7 +147,7 @@ class Connection {
     /**
      * Downloads the photo from the server and saves it to file
      */
-    public void downloadFile() throws IOException { // toDo: timeout when connection is unexpectedly closed
+    public void downloadFile() throws IOException, PackageDeliveryException { // toDo: timeout when connection is unexpectedly closed
         openConnection(Packet.DOWNLOAD);
         if (connId == 0) {
             System.err.println("Connection was not opened, RST flag was sent to the server");
@@ -157,35 +174,43 @@ class Connection {
             }
             handler.closeStream();
         }
+        socket.close();
     }
 
     /**
      * Uploads the file with firmware to the server
      */
-    public void uploadFile() throws IOException {
+    public void uploadFile() throws IOException, PackageDeliveryException {
         openConnection(Packet.UPLOAD);
         if (connId == 0) {
             System.err.println("Connection was not opened, RST flag was sent to the server");
         } else {
             FileSender sender = new FileSender(this, fileName);
-            Thread t = new Thread(sender);
-            t.start();
+            Thread windowSenderThread = sender.getTimeoutedWindowSenderThread();
+            Thread receiverThread = sender.getReceiverThread();
+            receiverThread.start();
+            windowSenderThread.start();
+            while (!closed) {
+            }
         }
+        socket.close();
     }
 
+
     /**
-     * Thread that awaits packet on a socket. Implements runnable, so can be interrupted/timeouted.
+     * Thread that awaits initial packet on a socket. Implements runnable, so can be interrupted/timeouted.
      */
     private class InitialPacketReceiver implements Runnable {
 
         @Override
         public void run() {
             try {
-                Packet packet = null;
-                while (packet == null || !packet.isValidInitialResponse()) {
+                Packet packet;
+                do {
                     packet = receivePacket();
-                }
+                } while (!packet.isValidInitialResponse());
                 connId = packet.getConnId();
+            } catch (SocketException e) {
             } catch (IOException e) {
                 e.printStackTrace();
             }
@@ -204,7 +229,7 @@ interface PacketHandler {
      * @param packet
      * @return
      */
-    Packet handlePacket(Packet packet);
+    Packet handlePacket(Packet packet) throws PackageDeliveryException;
 }
 
 /**
@@ -313,7 +338,7 @@ class FileReceiver implements PacketHandler {
 /**
  * Sends a file by packets to the server
  */
-class FileSender implements Runnable {
+class FileSender implements PacketHandler {
 
     private final int WINDOW_SIZE = 8;  // 8 packets containing up to 255 bytes of data = 2040
     private final int TIMEOUT = 100;    // timeout in milliseconds
@@ -324,7 +349,6 @@ class FileSender implements Runnable {
     private int requestedSeq = 0;   // the last packet that was requested by the server
     private long lastSent;   // time of the last sent packet
     // toDo: three times same ack behaviour
-
 
     public FileSender(Connection connection, String fileName) {
         try {
@@ -339,54 +363,56 @@ class FileSender implements Runnable {
     }
 
     @Override
-    public void run() {
-        sendWindow();
-        try {
-            Packet packet;
-            do {
-                packet = connection.receivePacket();
-                if (packet.getConnId() != connection.getConnId()) {
-                    continue;
-                }
-                if (packet.getFlag() == Packet.RST_FLAG) {
-                    System.err.println("\nServer has reset the connection.\n");
-                    return;
-                }
-                int ack = packet.getAck();
-                while (ack % 255 != 0) {
-                    ack += 0x10000;
-                }
-                if (ack > requestedSeq) {
-                    Iterator<byte[]> iterator = content.iterator();
-                    int diff = ack - requestedSeq;  // amount of bytes that should be removed from the window
-                    while (iterator.hasNext() && diff > 0) {
-                        diff -= iterator.next().length;
-                        iterator.remove();
-                    }
-                    requestedSeq = ack;
-                    refillWindow();
-                    sendWindow();
-                }
-                if (System.currentTimeMillis() > lastSent + TIMEOUT) {
-                    sendWindow();
-                }
-            } while (content.size() > 0);
-            connection.sendPacket(Packet.finPacket(connection.getConnId(), packet.getAck(), Mode.UPLOAD));
-        } catch (IOException e) {
-            System.err.println("Error while receiving packet.");
+    public synchronized Packet handlePacket(Packet packet) throws PackageDeliveryException {
+        if (packet.getFlag() == Packet.RST_FLAG) {
+            System.err.println("\nServer has reset the connection.\n");
+            closeStream();
+            connection.setClosed(true);
+            return null;
         }
+        // connection was properly closed
+        if (packet.getFlag() == Packet.FIN_FLAG) {
+            System.out.print("\n\nUPLOADING FINISHED\n\n");
+            closeStream();
+            connection.setClosed(true);
+            return null;
+        }
+        if (content.size() == 0) {
+            connection.sendPacket(Packet.finPacket(connection.getConnId(), packet.getAck(), Mode.UPLOAD));
+            return null;
+        }
+        int ack = packet.getAck();
+        while (ack % 255 != 0) {
+            ack += 0x10000;
+        }
+        if (ack > requestedSeq) {
+            Iterator<byte[]> iterator = content.iterator();
+            int diff = ack - requestedSeq;  // amount of bytes that should be removed from the window
+            while (iterator.hasNext() && diff > 0) {
+                diff -= iterator.next().length;
+                iterator.remove();
+            }
+            requestedSeq = ack;
+            refillWindow();
+            sendWindow();
+        }
+        return null;
     }
 
     /**
-     * Sends the whole window
+     * Sends the whole window or FIN packet if the window is empty
      */
-    private void sendWindow() {
-        int packetSeq = requestedSeq;
-        for (byte[] bytes : content) {
-            connection.sendPacket(Packet.dataPacket(connection.getConnId(), packetSeq, bytes));
-            lastSent = System.currentTimeMillis();
-            packetSeq += bytes.length;
+    private synchronized void sendWindow() throws PackageDeliveryException {
+        if (content.size() > 0) {
+            int packetSeq = requestedSeq;
+            for (byte[] bytes : content) {
+                connection.sendPacket(Packet.dataPacket(connection.getConnId(), packetSeq, bytes));
+                packetSeq += bytes.length;
+            }
+        } else if (!connection.isClosed()) {
+            connection.sendPacket(Packet.finPacket(connection.getConnId(), requestedSeq, Mode.UPLOAD));
         }
+        lastSent = System.currentTimeMillis();
     }
 
     /**
@@ -394,7 +420,7 @@ class FileSender implements Runnable {
      *
      * @return
      */
-    private boolean refillWindow() {
+    private synchronized boolean refillWindow() {
         int bytesRead;
         do {
             try {
@@ -412,10 +438,87 @@ class FileSender implements Runnable {
     }
 
     /**
-     * Thread that awaits packet on a socket. Implements runnable, so can be interrupted/timeouted.
+     * Returns a new instance of the {@link robot.FileSender.ResponsePacketReceiver} thread
+     *
+     * @return
      */
-    private class PacketReceiver {
+    public Thread getReceiverThread() {
+        return new Thread(new ResponsePacketReceiver());
+    }
 
+    /**
+     * Returns a new instance of the {@link robot.FileSender.TimeoutedWindowSender} thread
+     *
+     * @return
+     */
+    public Thread getTimeoutedWindowSenderThread() {
+        return new Thread(new TimeoutedWindowSender());
+    }
+
+    public long getLastSent() {
+        return lastSent;
+    }
+
+    /**
+     * Properly closes the stream when all the connection is closed
+     *
+     * @return true if closing was successful
+     */
+    public boolean closeStream() {
+        try {
+            fis.close();
+        } catch (IOException e) {
+            System.err.println("Cannot close stream.");
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Thread that awaits data response packet on a socket. Implements runnable, so can be interrupted/timeouted.
+     */
+    private class ResponsePacketReceiver implements Runnable {
+
+        @Override
+        public void run() {
+            // send the window when this thread starts
+            try {
+                Packet packet;
+                do {
+                    packet = connection.receivePacket();
+                    boolean sameId = packet.getConnId() == connection.getConnId();
+                    // toDo: ack should be within window size
+                    if (!sameId || !packet.isValid()) {
+                        connection.sendPacket(Packet.rstPacket(packet.getConnId()));
+                    }
+                    handlePacket(packet);
+                } while (packet.getFlag() != Packet.FIN_FLAG);
+            } catch (IOException e) {
+                e.printStackTrace();
+            } catch (PackageDeliveryException e) {
+                System.err.println(e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Sends the window if the timeout occured
+     */
+    private class TimeoutedWindowSender implements Runnable {
+
+        @Override
+        public void run() {
+            while (!connection.isClosed()) {
+                if (System.currentTimeMillis() > getLastSent() + TIMEOUT) {
+                    try {
+                        sendWindow();
+                    } catch (PackageDeliveryException e) {
+                        System.err.println(e.getMessage());
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -540,6 +643,16 @@ class Packet {
     }
 
     /**
+     * Create a reset packet
+     *
+     * @param connId
+     * @return
+     */
+    public static Packet rstPacket(int connId) {
+        return new Packet(connId, (short) 0, (short) 0, RST_FLAG, new byte[0]);
+    }
+
+    /**
      * Prints the content of the packet to stdout
      *
      * @param packetType .
@@ -563,13 +676,27 @@ class Packet {
     }
 
     /**
-     * Returns true if the packet is valid data packet for given connId
+     * Returns true if the packet does not have any combination of flags
      *
-     * @param connId
      * @return
      */
-    public boolean isValidDataPacket(int connId) {
-        return flag == EMPTY_FLAG && this.connId == connId;
+    public boolean hasValidFlag() {
+        return flag == EMPTY_FLAG || flag == RST_FLAG || flag == FIN_FLAG || flag == SYN_FLAG;
+    }
+
+    /**
+     * Returns false if the packet is invalid and the connection should be reset
+     *
+     * @return
+     */
+    public boolean isValid() {
+        if (flag == SYN_FLAG && (data != DOWNLOAD || data != UPLOAD)) {
+            return false;
+        }
+        if (flag == FIN_FLAG && data.length > 0) {
+            return false;
+        }
+        return hasValidFlag();
     }
 
     /**
@@ -601,4 +728,25 @@ enum PacketType {
 
 enum Mode {
     DOWNLOAD, UPLOAD;
+}
+
+/**
+ * An exception that is thrown when a package was not delivered 20 times in a row
+ */
+class PackageDeliveryException extends Exception {
+
+    public PackageDeliveryException() {
+    }
+
+    public PackageDeliveryException(String message) {
+        super(message);
+    }
+
+    public PackageDeliveryException(String message, Throwable cause) {
+        super(message, cause);
+    }
+
+    public PackageDeliveryException(Throwable cause) {
+        super(cause);
+    }
 }
