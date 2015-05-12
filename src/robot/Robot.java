@@ -6,6 +6,7 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.concurrent.*;
@@ -42,7 +43,7 @@ class Connection {
     private final DatagramSocket socket;
     private final long startTime;   // time when the connection was established (for timeout)
     private int connId = 0; // id of this connection
-    private File uploadFile;    // file to upload to server
+    private String fileName;    // name of file that is to be uploaded to the server
 
     // toDo: handle exceptions
     public Connection(String address) throws IOException {
@@ -52,9 +53,13 @@ class Connection {
         System.out.printf("Connecting to %s:%d%n", address, REMOTE_PORT);
     }
 
-    public Connection(String address, String file) throws IOException {
+    public Connection(String address, String fileName) throws IOException {
         this(address);
-        this.uploadFile = new File(file);
+        this.fileName = fileName;
+    }
+
+    public int getConnId() {
+        return connId;
     }
 
     /**
@@ -66,7 +71,10 @@ class Connection {
     public boolean sendPacket(Packet packet) {
         try {
             packet.printPacket(PacketType.SENT);
-            socket.send(packet.createPacket());
+            DatagramPacket datgramPacket = packet.createPacket();
+            datgramPacket.setAddress(address);
+            datgramPacket.setPort(REMOTE_PORT);
+            socket.send(datgramPacket);
             return true;
         } catch (IOException e) {
             return false;
@@ -97,7 +105,7 @@ class Connection {
         Future future = executorService.submit(new InitialPacketReceiver());
         // repeat the initial message 20 times if the response is invalid
         do {
-            sendPacket(Packet.initialPacket(initialData, address, REMOTE_PORT));
+            sendPacket(Packet.initialPacket(initialData));
             try {
                 future.get(TIMEOUT, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
@@ -112,7 +120,7 @@ class Connection {
         } while (connId == 0 && retryCount++ < 19);
         // reset the connection if the response is still invalid
         if (connId == 0) {
-            sendPacket(new Packet(0, (short) 0, (short) 0, Packet.RST_FLAG, new byte[0], address, REMOTE_PORT));
+            sendPacket(new Packet(0, (short) 0, (short) 0, Packet.RST_FLAG, new byte[0]));
         } else {
             future.cancel(true);
             executorService.shutdown();
@@ -130,7 +138,7 @@ class Connection {
             // got valid response, start accepting photo packets
             // flag has to be 0, connId has to be the same
             System.out.print("\n\nDOWNLOADING STARTED\n\n");
-            DataPacketHandler handler = new DataPacketHandler();
+            FileReceiver handler = new FileReceiver();
             Packet dataPacket;
             Packet packetToSend = null;
             do {
@@ -143,7 +151,7 @@ class Connection {
                 }
                 packetToSend = handler.handlePacket(dataPacket);
             } while (dataPacket.getFlag() == Packet.EMPTY_FLAG || dataPacket.getConnId() != connId);
-            if (packetToSend.getFlag() == Packet.FIN_FLAG) {
+            if (packetToSend != null && packetToSend.getFlag() == Packet.FIN_FLAG) {
                 sendPacket(packetToSend);
                 System.out.print("\n\nDOWNLOADING FINISHED\n\n");
             }
@@ -159,7 +167,9 @@ class Connection {
         if (connId == 0) {
             System.err.println("Connection was not opened, RST flag was sent to the server");
         } else {
-            // toDo: implement
+            FileSender sender = new FileSender(this, fileName);
+            Thread t = new Thread(sender);
+            t.start();
         }
     }
 
@@ -200,16 +210,16 @@ interface PacketHandler {
 /**
  * Handles incoming data packets and writes the data to file
  */
-class DataPacketHandler implements PacketHandler {
+class FileReceiver implements PacketHandler {
 
     private final String FILENAME = "foto.png";
     private final int WINDOW_SIZE = 8;  // 8 packets containing up to 255 bytes of data = 2040
     private File file;
     private FileOutputStream fos;
-    private LinkedList<byte[]> content;   // list of complete photo data
+    private LinkedList<byte[]> content;   // data in current window
     private int written = 0;    // amount of written bytes
 
-    public DataPacketHandler() {
+    public FileReceiver() {
         try {
             this.file = new File(FILENAME);
             this.fos = new FileOutputStream(file);
@@ -230,7 +240,7 @@ class DataPacketHandler implements PacketHandler {
     public Packet handlePacket(Packet packet) {
         // downloading is completed
         if (packet.getFlag() == Packet.FIN_FLAG) {
-            return Packet.finPacket(packet.getConnId(), packet.getSeq(), packet.getAddress(), packet.getPort());
+            return Packet.finPacket(packet.getConnId(), packet.getSeq(), Mode.DOWNLOAD);
         }
         int seq = packet.getSeq();
         // get correct index if unsigned int overflowed (even multiple times)
@@ -246,7 +256,7 @@ class DataPacketHandler implements PacketHandler {
         }
         writeToFile();
         shiftWindow();
-        return new Packet(packet.getConnId(), (short) 0, (short) written, Packet.EMPTY_FLAG, new byte[0], packet.getAddress(), packet.getPort());
+        return new Packet(packet.getConnId(), (short) 0, (short) written, Packet.EMPTY_FLAG, new byte[0]);
     }
 
     /**
@@ -303,19 +313,109 @@ class DataPacketHandler implements PacketHandler {
 /**
  * Sends a file by packets to the server
  */
-class FileSender {
+class FileSender implements Runnable {
 
     private final int WINDOW_SIZE = 8;  // 8 packets containing up to 255 bytes of data = 2040
-    private File file;
+    private final int TIMEOUT = 100;    // timeout in milliseconds
+    private Connection connection;
+    private File file;  // file that is being sent
     private FileInputStream fis;
+    private LinkedList<byte[]> content; // actual packet sending window, starting with requested packet
+    private int requestedSeq = 0;   // the last packet that was requested by the server
+    private long lastSent;   // time of the last sent packet
+    // toDo: three times same ack behaviour
 
-    public FileSender(String fileName) {
+
+    public FileSender(Connection connection, String fileName) {
         try {
+            this.connection = connection;
             this.file = new File(fileName);
             this.fis = new FileInputStream(file);
+            this.content = new LinkedList<>();  // data in current window
+            refillWindow();
         } catch (FileNotFoundException e) {
             System.err.printf("File %s was not found.%n", fileName);
         }
+    }
+
+    @Override
+    public void run() {
+        sendWindow();
+        try {
+            Packet packet;
+            do {
+                packet = connection.receivePacket();
+                if (packet.getConnId() != connection.getConnId()) {
+                    continue;
+                }
+                if (packet.getFlag() == Packet.RST_FLAG) {
+                    System.err.println("\nServer has reset the connection.\n");
+                    return;
+                }
+                int ack = packet.getAck();
+                while (ack % 255 != 0) {
+                    ack += 0x10000;
+                }
+                if (ack > requestedSeq) {
+                    Iterator<byte[]> iterator = content.iterator();
+                    int diff = ack - requestedSeq;  // amount of bytes that should be removed from the window
+                    while (iterator.hasNext() && diff > 0) {
+                        diff -= iterator.next().length;
+                        iterator.remove();
+                    }
+                    requestedSeq = ack;
+                    refillWindow();
+                    sendWindow();
+                }
+                if (System.currentTimeMillis() > lastSent + TIMEOUT) {
+                    sendWindow();
+                }
+            } while (content.size() > 0);
+            connection.sendPacket(Packet.finPacket(connection.getConnId(), packet.getAck(), Mode.UPLOAD));
+        } catch (IOException e) {
+            System.err.println("Error while receiving packet.");
+        }
+    }
+
+    /**
+     * Sends the whole window
+     */
+    private void sendWindow() {
+        int packetSeq = requestedSeq;
+        for (byte[] bytes : content) {
+            connection.sendPacket(Packet.dataPacket(connection.getConnId(), packetSeq, bytes));
+            lastSent = System.currentTimeMillis();
+            packetSeq += bytes.length;
+        }
+    }
+
+    /**
+     * Refill the data window so it has a maximum of {@link FileSender#WINDOW_SIZE} data packets
+     *
+     * @return
+     */
+    private boolean refillWindow() {
+        int bytesRead;
+        do {
+            try {
+                byte[] bytes = new byte[255];
+                bytesRead = fis.read(bytes, 0, bytes.length);
+                if (bytesRead > 0) {
+                    content.add(Arrays.copyOf(bytes, bytesRead));
+                }
+            } catch (IOException e) {
+                System.err.printf("Cannot read from the file %s.%n", file.getName());
+                return false;
+            }
+        } while (content.size() < WINDOW_SIZE && bytesRead > 0);
+        return true;
+    }
+
+    /**
+     * Thread that awaits packet on a socket. Implements runnable, so can be interrupted/timeouted.
+     */
+    private class PacketReceiver {
+
     }
 }
 
@@ -344,17 +444,13 @@ class Packet {
     private final int ack;
     private final byte flag;
     private final byte[] data;
-    private final InetAddress address;
-    private final int port;
 
-    public Packet(int connId, int seq, int ack, byte flag, byte[] data, InetAddress address, int port) {
+    public Packet(int connId, int seq, int ack, byte flag, byte[] data) {
         this.connId = connId;
         this.seq = seq;
         this.ack = ack;
         this.flag = flag;
         this.data = data;
-        this.address = address;
-        this.port = port;
     }
 
     public Packet(DatagramPacket packet) {
@@ -367,8 +463,6 @@ class Packet {
         for (int i = 0; i < data.length; ++i) {
             data[i] = buffer.get();
         }
-        this.address = packet.getAddress();
-        this.port = packet.getPort();
     }
 
     public int getConnId() {
@@ -391,14 +485,6 @@ class Packet {
         return data;
     }
 
-    public InetAddress getAddress() {
-        return address;
-    }
-
-    public int getPort() {
-        return port;
-    }
-
     /**
      * Create a {@link DatagramPacket} out of the data.
      *
@@ -411,7 +497,7 @@ class Packet {
         byteBuffer.putShort((short) (ack & 0xffff));
         byteBuffer.put(flag);
         byteBuffer.put(data);
-        DatagramPacket packet = new DatagramPacket(byteBuffer.array(), data.length + 9, address, port);
+        DatagramPacket packet = new DatagramPacket(byteBuffer.array(), data.length + 9);
         return packet;
     }
 
@@ -419,24 +505,38 @@ class Packet {
      * Create initial packet, use {@link Packet#DOWNLOAD} or {@link Packet#UPLOAD} as an argument
      *
      * @param data
-     * @param address
-     * @param port
      * @return
      */
-    public static Packet initialPacket(byte[] data, InetAddress address, int port) {
-        return new Packet(0, (short) 0, (short) 0, SYN_FLAG, data, address, port);
+    public static Packet initialPacket(byte[] data) {
+        return new Packet(0, (short) 0, (short) 0, SYN_FLAG, data);
     }
 
     /**
      * Create packet that is sent after successfully downloading a photo
      *
      * @param connId
-     * @param address
-     * @param port
      * @return
      */
-    public static Packet finPacket(int connId, int ack, InetAddress address, int port) {
-        return new Packet(connId, (short) 0, (short) ack & 0xffff, FIN_FLAG, new byte[0], address, port);
+    public static Packet finPacket(int connId, int lastSeq, Mode mode) {
+        if (mode == Mode.DOWNLOAD) {
+            return new Packet(connId, (short) 0, (short) lastSeq & 0xffff, FIN_FLAG, new byte[0]);
+        } else if (mode == Mode.UPLOAD) {
+            return new Packet(connId, (short) lastSeq & 0xffff, (short) 0, FIN_FLAG, new byte[0]);
+        } else {
+            throw new IllegalArgumentException("Invalid mode: " + mode);
+        }
+    }
+
+    /**
+     * Create a packet with file data
+     *
+     * @param connId
+     * @param seq
+     * @param data
+     * @return
+     */
+    public static Packet dataPacket(int connId, int seq, byte[] data) {
+        return new Packet(connId, seq, (short) 0, EMPTY_FLAG, data);
     }
 
     /**
@@ -497,4 +597,8 @@ enum PacketType {
     public String getTitle() {
         return title;
     }
+}
+
+enum Mode {
+    DOWNLOAD, UPLOAD;
 }
