@@ -81,8 +81,9 @@ class Connection {
      * @param packet
      * @return true if sending was successful
      */
-    public boolean sendPacket(Packet packet) throws PackageDeliveryException {
-        if (packet.getData().length > 0 && packet.getSeq() == lastSeq && sameSeqCount++ > 19) {
+    public synchronized boolean sendPacket(Packet packet) throws PackageDeliveryException {
+        if (packet.getSeq() != 0 && packet.getSeq() == lastSeq && sameSeqCount++ > 19) {
+            closed = true;
             throw new PackageDeliveryException("Sending a packet with seq " + packet.getSeq() + " 20 times in a row");
         }
         try {
@@ -243,6 +244,7 @@ class FileReceiver implements PacketHandler {
     private FileOutputStream fos;
     private LinkedList<byte[]> content;   // data in current window
     private int written = 0;    // amount of written bytes
+    private boolean eof = false;    // end of file was encountered
 
     public FileReceiver() {
         try {
@@ -266,6 +268,10 @@ class FileReceiver implements PacketHandler {
         // downloading is completed
         if (packet.getFlag() == Packet.FIN_FLAG) {
             return Packet.finPacket(packet.getConnId(), packet.getSeq(), Mode.DOWNLOAD);
+        }
+        if (packet.getSeq() > written + WINDOW_SIZE * 255) {
+            System.err.printf("Receiving packet with seq %d, which is out of window.", packet.getSeq());
+            return new Packet(packet.getConnId(), (short) 0, (short) written, Packet.EMPTY_FLAG, new byte[0]);
         }
         int seq = packet.getSeq();
         // get correct index if unsigned int overflowed (even multiple times)
@@ -294,12 +300,15 @@ class FileReceiver implements PacketHandler {
             Iterator<byte[]> iterator = content.iterator();
             while (iterator.hasNext()) {
                 byte[] data = iterator.next();
-                if (data == null) {
+                if (data == null || eof) {
                     break;
                 } else {
                     fos.write(data);
                     written += data.length;
                     iterator.remove();
+                    if (data.length < 255) {
+                        eof = true;
+                    }
                 }
             }
         } catch (IOException e) {
